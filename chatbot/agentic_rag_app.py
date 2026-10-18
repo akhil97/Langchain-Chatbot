@@ -2,7 +2,8 @@ import io
 import json
 import os
 import re
-from typing import Any
+from datetime import date
+from typing import Any, Literal
 
 import arxiv
 import streamlit as st
@@ -22,14 +23,25 @@ MAX_TOOL_CALLS = 6
 
 def create_search_tools(tavily_api_key: str):
     @tool
-    def tavily_search(query: str) -> str:
-        """Search the web for current events, recent news, and time-sensitive information."""
+    def tavily_search(
+        query: str,
+        topic: Literal["news", "general", "finance"] = "news",
+        time_range: Literal["day", "week", "month", "year"] = "week",
+    ) -> str:
+        """Search the web for current information. Use topic='news' and choose a time_range
+        of day, week, month, or year for latest/current-events questions. Use general or finance
+        for non-news web research. Results include publication dates when Tavily provides them."""
         if not tavily_api_key:
             return "Tavily search is unavailable because no Tavily API key was provided."
 
         try:
             results = TavilyClient(api_key=tavily_api_key).search(
-                query=query, search_depth="basic", max_results=5
+                query=query,
+                topic=topic,
+                time_range=time_range if topic == "news" else None,
+                search_depth="advanced",
+                max_results=5,
+                max_age_hours=24,
             ).get("results", [])
             if not results:
                 return "Tavily search returned no results."
@@ -39,6 +51,7 @@ def create_search_tools(tavily_api_key: str):
                 entries.append(
                     f"Title: {result.get('title') or 'Untitled'}\n"
                     f"URL: {result.get('url') or 'No URL provided'}\n"
+                    f"Published: {result.get('published_date') or 'Date not provided'}\n"
                     f"Summary: {result.get('content') or 'No summary provided'}"
                 )
             return "\n\n".join(entries)
@@ -128,11 +141,18 @@ def read_uploaded_pdf(uploaded_file) -> tuple[str, str | None]:
 
 
 def get_system_prompt(pdf_context: str) -> str:
-    prompt = """You are a helpful research assistant. Answer directly when the question can
+    prompt = f"""You are a helpful research assistant. Today's date is {date.today().isoformat()}.
+Answer directly when the question can
 be handled from general knowledge; otherwise choose whichever of your search tools is useful.
 You may call multiple tools in sequence to verify or combine information. Do not claim a tool
 was used unless you actually called it. Use the sources returned by tools to support factual
-claims, and preserve their URLs when citing them. Be clear when search results are inconclusive."""
+claims, and preserve their URLs when citing them. Be clear when search results are inconclusive.
+For questions asking what is latest, recent, current, or happening now, don't rely on model
+knowledge: call tavily_search with topic='news' and a time_range appropriate to the question
+(default to 'week' when no period is specified). Check each result's Published date before using
+it as current, mention dates in the answer, and say when a source has no publication date or
+the search did not find sufficiently recent information. If a short time range finds nothing,
+you may retry with a wider range and disclose that change."""
 
     if pdf_context:
         prompt += (
