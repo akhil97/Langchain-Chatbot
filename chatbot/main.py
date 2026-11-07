@@ -7,20 +7,31 @@ from langchain.agents.middleware import ToolCallLimitMiddleware
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_openrouter import ChatOpenRouter
 
-from app_config import MAX_PDF_UPLOAD_MB, MAX_TOOL_CALLS
+from app_config import (
+    MAX_PDF_UPLOAD_MB,
+    MAX_TOOL_CALLS,
+    PDF_CHUNK_OVERLAP,
+    PDF_CHUNK_SIZE,
+    PDF_EMBEDDING_MODEL,
+)
 from rag_services import (
     assess_document_support,
-    build_pdf_vector_store,
     collect_activity,
     collect_contexts,
     collect_sources,
     create_search_tools,
     get_system_prompt,
     load_pdf_documents,
+    load_or_build_pdf_hybrid_index,
     message_text,
     retrieve_pdf_context,
 )
-from ui_components import render_activity, render_pdf_evidence, render_ragas_evaluation
+from ui_components import (
+    render_activity,
+    render_deepeval_evaluation,
+    render_pdf_evidence,
+    render_ragas_evaluation,
+)
 
 
 def main() -> None:
@@ -36,7 +47,10 @@ def main() -> None:
         unsafe_allow_html=True,
     )
     st.title("Agentic RAG")
-    st.caption("Ask a question. The agent can search the web, Wikipedia, and arXiv—or answer directly.")
+    st.caption(
+        "Ask a question. Uploaded PDFs use hybrid keyword and semantic search; "
+        "the agent can also search the web, Wikipedia, and arXiv."
+    )
 
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
@@ -59,7 +73,7 @@ def main() -> None:
         embedding_model = st.text_input(
             "OpenRouter embedding model",
             value="openai/text-embedding-3-small",
-            help="Used for folder-wide PDF vector retrieval and RAGAS answer relevancy.",
+            help="Used for RAGAS answer relevancy only. PDF retrieval uses a local embedding model.",
         )
         uploaded_pdfs = st.file_uploader(
             "Upload a folder of PDFs",
@@ -121,6 +135,58 @@ def main() -> None:
             "does not contain it."
         )
 
+    pdf_vector_store = None
+    pdf_keyword_retriever = None
+    pdf_index_error = None
+    if uploaded_pdfs and pdf_documents:
+        index_fingerprint = (
+            f"{pdf_key}:{PDF_EMBEDDING_MODEL}:{PDF_CHUNK_SIZE}:{PDF_CHUNK_OVERLAP}"
+        )
+        document_key = hashlib.sha256(index_fingerprint.encode("utf-8")).hexdigest()
+        cached_index = st.session_state.get("pdf_index_cache")
+        if cached_index and cached_index["key"] == document_key:
+            pdf_vector_store = cached_index["vector_store"]
+            pdf_keyword_retriever = cached_index["keyword_retriever"]
+        else:
+            progress_bar = st.progress(0, text="Preparing the PDF hybrid index...")
+
+            def update_index_progress(fraction: float, message: str) -> None:
+                progress_bar.progress(fraction, text=message)
+
+            try:
+                (
+                    pdf_vector_store,
+                    pdf_keyword_retriever,
+                    cache_hit,
+                    chunk_count,
+                ) = load_or_build_pdf_hybrid_index(
+                    pdf_documents,
+                    document_key,
+                    progress_callback=update_index_progress,
+                )
+                st.session_state.pdf_index_cache = {
+                    "key": document_key,
+                    "vector_store": pdf_vector_store,
+                    "keyword_retriever": pdf_keyword_retriever,
+                }
+                if cache_hit:
+                    progress_bar.progress(
+                        1.0,
+                        text=f"Loaded cached hybrid index ({chunk_count:,} chunks)",
+                    )
+                else:
+                    progress_bar.progress(
+                        1.0,
+                        text=f"PDF hybrid index ready ({chunk_count:,} chunks)",
+                    )
+            except Exception as exc:
+                pdf_index_error = (
+                    f"PDF indexing failed ({type(exc).__name__}). "
+                    "Check that the local embedding model can be downloaded and "
+                    "that the uploaded PDFs contain extractable text."
+                )
+                st.error(pdf_index_error)
+
     for turn_index, item in enumerate(st.session_state.chat_history):
         with st.chat_message(item["role"]):
             st.markdown(item["content"])
@@ -128,6 +194,12 @@ def main() -> None:
                 render_activity(item.get("activity", []))
                 render_pdf_evidence(item.get("pdf_context", ""))
                 if item.get("question"):
+                    render_deepeval_evaluation(
+                        item,
+                        turn_index,
+                        openrouter_api_key,
+                        model_name,
+                    )
                     render_ragas_evaluation(
                         item,
                         turn_index,
@@ -172,34 +244,24 @@ def main() -> None:
                 {"role": "assistant", "content": answer, "activity": []}
             )
             return
+        if pdf_index_error:
+            with st.chat_message("assistant"):
+                st.error(pdf_index_error)
+            st.session_state.chat_history.append(
+                {"role": "assistant", "content": pdf_index_error, "activity": []}
+            )
+            return
         try:
-            document_key = hashlib.sha256(
-                (pdf_key + embedding_model.strip()).encode("utf-8")
-            ).hexdigest()
-            cached_index = st.session_state.get("pdf_index_cache")
-            if not cached_index or cached_index["key"] != document_key:
-                with st.spinner("Chunking PDF and building its vector index..."):
-                    vector_store = build_pdf_vector_store(
-                        pdf_documents,
-                        openrouter_api_key.strip(),
-                        embedding_model.strip(),
-                    )
-                st.session_state.pdf_index_cache = {
-                    "key": document_key,
-                    "vector_store": vector_store,
-                }
-            else:
-                vector_store = cached_index["vector_store"]
-
-            with st.spinner("Retrieving relevant PDF chunks..."):
+            with st.spinner("Searching PDFs by meaning and keywords..."):
                 pdf_context, pdf_contexts = retrieve_pdf_context(
-                    vector_store,
+                    pdf_vector_store,
+                    pdf_keyword_retriever,
                     question,
                 )
         except Exception as exc:
             answer = (
                 f"PDF indexing or retrieval failed ({type(exc).__name__}). "
-                "Check OpenRouter embedding access and the uploaded PDF."
+                "Check the local embedding model and the uploaded PDF."
             )
             with st.chat_message("assistant"):
                 st.error(answer)

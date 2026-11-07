@@ -3,7 +3,7 @@ from typing import Any
 
 import streamlit as st
 
-from rag_services import evaluate_answer_with_ragas
+from rag_services import evaluate_answer_with_deepeval, evaluate_answer_with_ragas
 
 
 def render_activity(activity: list[dict[str, str]]) -> None:
@@ -104,4 +104,81 @@ def render_ragas_evaluation(
                         f"RAGAS evaluation failed ({type(exc).__name__}). "
                         "Check the OpenRouter model, API key, embedding access, "
                         "and reference/context inputs."
+                    )
+
+
+def render_deepeval_evaluation(
+    item: dict[str, Any],
+    turn_index: int,
+    api_key: str,
+    model_name: str,
+) -> None:
+    with st.expander("Evaluate this answer with DeepEval", expanded=False):
+        st.caption(
+            "Scores range from 0 to 1. Answer relevancy is always measured; "
+            "faithfulness and contextual relevancy require retrieved context. "
+            "Add a reference answer to include contextual precision and recall."
+        )
+        evaluation = item.get("deepeval_evaluation")
+        if evaluation:
+            columns = st.columns(len(evaluation))
+            for column, (metric, result) in zip(columns, evaluation.items()):
+                column.metric(
+                    metric.replace("_", " ").title(),
+                    f"{result['score']:.3f}",
+                    "PASS" if result["passed"] else "BELOW 0.70",
+                )
+            with st.expander("Metric explanations"):
+                for metric, result in evaluation.items():
+                    st.markdown(
+                        f"**{metric.replace('_', ' ').title()}** — "
+                        f"{'Passed' if result['passed'] else 'Below threshold'}"
+                    )
+                    st.write(result["reason"] or "No explanation returned.")
+
+        with st.form(f"deepeval-evaluation-{turn_index}"):
+            reference = st.text_area(
+                "Reference answer (optional)",
+                value=item.get("deepeval_reference", ""),
+                key=f"deepeval-reference-{turn_index}",
+                help=(
+                    "A trusted expected answer enables contextual precision and "
+                    "contextual recall when retrieved context exists."
+                ),
+            )
+            submitted = st.form_submit_button("Run DeepEval evaluation")
+
+        if submitted:
+            if not item.get("response"):
+                st.error("There is no successful answer to evaluate.")
+            elif not api_key.strip():
+                st.error("Add your OpenRouter API key in the sidebar before evaluating.")
+            elif not model_name.strip():
+                st.error("Enter a valid OpenRouter model name.")
+            else:
+                try:
+                    with st.spinner("Scoring answer with DeepEval..."):
+                        item["deepeval_evaluation"] = evaluate_answer_with_deepeval(
+                            question=item["question"],
+                            answer=item["response"],
+                            contexts=item.get("contexts", []),
+                            reference=reference,
+                            api_key=api_key.strip(),
+                            model_name=model_name.strip(),
+                        )
+                    item["deepeval_reference"] = reference
+                    st.success("DeepEval evaluation complete.")
+                    columns = st.columns(len(item["deepeval_evaluation"]))
+                    for column, (metric, result) in zip(
+                        columns, item["deepeval_evaluation"].items()
+                    ):
+                        column.metric(
+                            metric.replace("_", " ").title(),
+                            f"{result['score']:.3f}",
+                            "PASS" if result["passed"] else "BELOW 0.70",
+                        )
+                except Exception as exc:
+                    st.error(
+                        f"DeepEval evaluation failed ({type(exc).__name__}). "
+                        "Check the OpenRouter key, model name, and model availability."
                     )
